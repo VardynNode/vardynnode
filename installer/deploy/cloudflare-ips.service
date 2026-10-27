@@ -1,0 +1,10 @@
+[Unit]
+Description=Update Cloudflare IP ranges for nginx real_ip module
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/update-cloudflare-ips.sh
+StandardOutput=journal
+StandardError=journal
