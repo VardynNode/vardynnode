@@ -1,23 +1,25 @@
 #!/bin/bash
-# ApexQuant — Update optional environment variables (FRED, AI providers)
+# 7.3.38: the settings are called VN_<name>; the earlier AQ_<name> is still accepted until the sunset (BACKLOG row 17) (a caller that still sets it is mapped here; VN_ wins).
+_vn_env_compat() { local _v _n; for _v in $(compgen -v); do case "$_v" in AQ_*) _n="VN_${_v#AQ_}"; [ -n "${!_n:-}" ] || export "$_n=${!_v}";; esac; done; }; _vn_env_compat
+# VardynNode — Update optional environment variables (FRED, AI providers)
 # Phase 4.11 (DEPLOY-2): customer-managed API key setup script.
 # All values are optional — press Enter to skip any.
 set -euo pipefail
 
-# ── ApexQuant setup logging + failure guidance (Phase 4.40.4) ────────────────
+# ── VardynNode setup logging + failure guidance (Phase 4.40.4) ────────────────
 # Saves the full run to a log the customer can send us, and prints clear
 # next-steps on ANY failure — including silent set -e/set -u aborts.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy/layout.sh"      # 7.1.4: the install layout, in one place
-if [[ "${_AQ_LOGGED:-}" != "1" ]]; then
-    export _AQ_LOGGED=1
-    export _AQ_LOG="${LAY_LOG_PREFIX}$(basename "$0" .sh)-$(date +%Y%m%d-%H%M%S).log"
-    install -m 600 /dev/null "$_AQ_LOG" 2>/dev/null || true   # pre-create at 600; perms survive a failed run
-    bash "$0" "$@" 2>&1 | tee "$_AQ_LOG"
+if [[ "${_VN_LOGGED:-}" != "1" ]]; then
+    export _VN_LOGGED=1
+    export _VN_LOG="${LAY_LOG_PREFIX}$(basename "$0" .sh)-$(date +%Y%m%d-%H%M%S).log"
+    install -m 600 /dev/null "$_VN_LOG" 2>/dev/null || true   # pre-create at 600; perms survive a failed run
+    bash "$0" "$@" 2>&1 | tee "$_VN_LOG"
     _rc=${PIPESTATUS[0]}
     exit "$_rc"
 fi
 
-_aq_fail_footer() {
+_vn_fail_footer() {
     local rc=$?
     [[ $rc -eq 0 ]] && return 0
     echo ""
@@ -26,13 +28,13 @@ _aq_fail_footer() {
     echo ""
     echo "  This is unexpected — we can help you fix it quickly:"
     echo "    • A full log was saved to:"
-    echo "        ${_AQ_LOG:-(scroll up and copy the output above)}"
+    echo "        ${_VN_LOG:-(scroll up and copy the output above)}"
     echo "    • Email that log to:  hello@vardynnode.com"
     echo "      (or reply to your welcome email and attach it)"
     echo "    • Self-help guide:    https://vardynnode.com/faq.html"
     echo "=================================================================="
 }
-trap _aq_fail_footer EXIT
+trap _vn_fail_footer EXIT
 # ─────────────────────────────────────────────────────────────────────────────
 
 APP_DIR="$LAY_INSTALL_DIR"

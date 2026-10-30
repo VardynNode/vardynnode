@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 7.3.38: the settings are called VN_<name>; the earlier AQ_<name> is still accepted until the sunset (BACKLOG row 17) (a caller that still sets it is mapped here; VN_ wins).
+_vn_env_compat() { local _v _n; for _v in $(compgen -v); do case "$_v" in AQ_*) _n="VN_${_v#AQ_}"; [ -n "${!_n:-}" ] || export "$_n=${!_v}";; esac; done; }; _vn_env_compat
 # update-cloudflare-ips.sh — 5.23.0-fix31-fix1
 # Refreshes /etc/nginx/conf.d/cloudflare-ips.conf from Cloudflare's official lists.
 # Run by cloudflare-ips.timer weekly. Safe to run manually at any time.
@@ -10,11 +12,11 @@
 #   - On ANY failure: keep current file, never wipe, never widen trust
 set -euo pipefail
 
-OUT="${AQ_CF_OUT:-/etc/nginx/conf.d/cloudflare-ips.conf}"      # (the override is for the tests)
+OUT="${VN_CF_OUT:-/etc/nginx/conf.d/cloudflare-ips.conf}"      # (the override is for the tests)
 TMP=$(mktemp)
 CANDIDATE="${OUT}.candidate"
 
-log() { echo "[CF-IPS] $*" | tee -a "${AQ_CF_LOG:-/var/log/cloudflare-ips-update.log}"; }
+log() { echo "[CF-IPS] $*" | tee -a "${VN_CF_LOG:-/var/log/cloudflare-ips-update.log}"; }
 fail() { log "ERROR: $*"; rm -f "$TMP" "$CANDIDATE"; exit 1; }
 
 log "Starting Cloudflare IP range update ($(date -u +%FT%TZ))"

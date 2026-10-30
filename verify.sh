@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Check a VardynNode download: its SHA-256 checksum and its minisign signature (the public key is the one pinned inside the installer and the updater).
 #
-#   ./verify.sh                                  download VardynNode-Setup.zip, its .sha256 and its .minisig into a temporary folder and check them
-#   ./verify.sh VardynNode-Setup.zip             check a file you already have (the .sha256 and .minisig are read from next to it, or downloaded)
-#   ./verify.sh VardynNode-Setup.zip <sha256>    also compare the checksum with one you copied from the Download page or from a release's notes
+#   bash verify.sh                                  download VardynNode-Setup.zip, its .sha256 and its .minisig into a temporary folder and check them
+#   bash verify.sh VardynNode-Setup.zip             check a file you already have (the .sha256 and .minisig are read from next to it, or downloaded)
+#   bash verify.sh VardynNode-Setup.zip <sha256>    also compare the checksum with one you copied from the Download page or from a release's notes
 #
 # Needs: curl, sha256sum (or shasum), minisign (sudo apt install minisign). It does not run or unpack the package.
 set -euo pipefail

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# migrate-layout.sh (7.2.0) - move an existing box from the old folder, service and command names (ApexQuant) to the new ones (VardynNode). Called by aq-update.sh after the package is verified and before
+# 7.3.38: the settings are called VN_<name>; the earlier AQ_<name> is still accepted until the sunset (BACKLOG row 17) (a caller that still sets it is mapped here; VN_ wins).
+_vn_env_compat() { local _v _n; for _v in $(compgen -v); do case "$_v" in AQ_*) _n="VN_${_v#AQ_}"; [ -n "${!_n:-}" ] || export "$_n=${!_v}";; esac; done; }; _vn_env_compat
+# migrate-layout.sh (7.2.0) - move an existing box from the old folder, service and command names (VardynNode) to the new ones (VardynNode). Called by vn-update.sh after the package is verified and before
 # the normal install step (and by "apexquant --migrate-layout"); safe to run again (a box that is already moved does nothing).
 #
 #   what it does:  backs up, stops the service, renames the install folder and the data folder (same file system only), leaves the old names as links to the new ones, points every link inside the folders at the
@@ -7,7 +9,7 @@
 #   the check:     the service stays active, the dashboard answers, the running marker is fresh, and the log shows no [FATAL]. If any of it fails everything is put back (the old folders, unit, command and
 #                  links; the old service is started again) and the box is marked migrate-failed. A box marked migrate-failed is not tried again unless a person asks for it (apexquant --migrate-layout).
 #   the journal:   $PREF_DIR/migrate-layout.state (state=running|done|failed, step=..., reason=...). A run that finds "running" was cut short (a crash, a power loss): it puts everything back first.
-#   opt-out:       the file $PREF_DIR/no-migrate-layout (or AQ_NO_MIGRATE_LAYOUT=1) keeps a box on the old names.
+#   opt-out:       the file $PREF_DIR/no-migrate-layout (or VN_NO_MIGRATE_LAYOUT=1) keeps a box on the old names.
 #   exit codes:    0 moved (or already moved)   1 failed, put back   2 failed, could NOT be put back completely (manual attention)   10 not applicable (custom layout, nothing installed, the new folders
 #                  already exist, a folder on its own mount)   11 not quiet (an order is being placed; nothing was changed, try again at the next window)   12 opted out   13 marked migrate-failed earlier
 set -u
@@ -17,17 +19,17 @@ export TAG="MIGRATE-LAYOUT"
 # shellcheck source=migrate-common.sh
 . "$HERE/migrate-common.sh"      # the pieces the two moves share (the journal, the health check, the quiet check, the unit check)
 
-TPL="${AQ_UNIT_TEMPLATE:-$HERE/apexquant.service}"
-LAYOUT_FILE="$(aq_layout_file)"
-UNIT_DIR="${AQ_UNIT_DIR:-$P/etc/systemd/system}"
-BIN_DIR="${AQ_BIN_DIR:-$P/usr/local/bin}"
-PREF_DIR="${AQ_PREF_DIR:-$P$LAY_PREF_DIR}"
-BACKUP_ROOT="${AQ_BACKUP_ROOT:-$P$LAY_BACKUP_ROOT}"
+TPL="${VN_UNIT_TEMPLATE:-$HERE/vardynnode.service}"
+LAYOUT_FILE="$(vn_layout_file)"
+UNIT_DIR="${VN_UNIT_DIR:-$P/etc/systemd/system}"
+BIN_DIR="${VN_BIN_DIR:-$P/usr/local/bin}"
+PREF_DIR="${VN_PREF_DIR:-$P$LAY_PREF_DIR}"
+BACKUP_ROOT="${VN_BACKUP_ROOT:-$P$LAY_BACKUP_ROOT}"
 export STATE; STATE="$PREF_DIR/migrate-layout.state"
 JDIR="$PREF_DIR/migrate-layout"      # the originals that a rollback puts back (rebuilt for every attempt)
 SAVED="$JDIR/saved"
 OPTOUT_FILE="$PREF_DIR/no-migrate-layout"
-FORCE="${AQ_MIGRATE_FORCE:-0}"
+FORCE="${VN_MIGRATE_FORCE:-0}"
 
 # the names: what the box has now (the old ones) and what it gets
 O_INSTALL="$LAY_LEGACY_INSTALL_DIR"; O_DATA="$LAY_LEGACY_DATA_DIR"; O_SERVICE="$LAY_LEGACY_SERVICE"; O_CLI="$LAY_LEGACY_CLI"      # always the old names (also when a cut-short run left the layout file written: it is then put back)
@@ -41,7 +43,7 @@ report_old_names(){      # files this installer did not make that still name the
     local f list=""
     for f in "$P/etc/cron.d"/* "$P/etc/logrotate.d"/* "$P/etc/sudoers.d"/* "$P/var/spool/cron/crontabs"/* "$P/etc/nginx/sites-available"/* "$P/etc/nginx/conf.d"/* "$P/usr/local/bin"/* "$P/usr/local/sbin"/* "$UNIT_DIR"/*.service "$UNIT_DIR"/*.timer "$UNIT_DIR"/*.service.d/*.conf; do
         [ -f "$f" ] && [ ! -L "$f" ] || continue
-        case "$f" in */aq-update.sh|*/"$O_SERVICE".service|*/"$O_SERVICE".service.prev|*/"$O_CLI") continue ;; esac
+        case "$f" in */vn-update.sh|*/"$O_SERVICE".service|*/"$O_SERVICE".service.prev|*/"$O_CLI") continue ;; esac
         grep -qIE "$O_INSTALL|$O_DATA" "$f" 2>/dev/null && list="$list ${f#"$P"}"
     done
     [ -z "$list" ] || say "these files name the old folders and keep working through the old-name links:$list"
@@ -119,7 +121,7 @@ step_settings_paths(){      # the same for a setting of the data file that holds
 }
 step_unit(){
     local rdir src; rdir="$(mktemp -d)"; src="$rdir/$N_SERVICE.service"
-    aq_render_unit "$TPL" "$N_INSTALL" "$N_DATA" "$DB_NAME" "$N_SERVICE" > "$src" || { rm -rf "$rdir"; return 1; }
+    vn_render_unit "$TPL" "$N_INSTALL" "$N_DATA" "$DB_NAME" "$N_SERVICE" > "$src" || { rm -rf "$rdir"; return 1; }
     [ -s "$src" ] || { rm -rf "$rdir"; return 1; }
     if ! verify_unit "$src"; then say "the new service unit did not pass systemd's check"; rm -rf "$rdir"; return 1; fi
     sysd_files disable "$O_SERVICE" >/dev/null 2>&1      # the boot link of the old unit goes (the new unit's own is made below)
@@ -138,12 +140,12 @@ step_unit(){
 }
 step_cli(){
     mkdir -p "$BIN_DIR"
-    aq_cli_shim_text "$N_INSTALL" > "$BIN_DIR/$N_CLI.new" && chmod 755 "$BIN_DIR/$N_CLI.new" && mv -f "$BIN_DIR/$N_CLI.new" "$BIN_DIR/$N_CLI" || return 1
-    aq_cli_legacy_shim_text "$BIN_DIR/$N_CLI" > "$BIN_DIR/$O_CLI.new" && chmod 755 "$BIN_DIR/$O_CLI.new" && mv -f "$BIN_DIR/$O_CLI.new" "$BIN_DIR/$O_CLI"
+    vn_cli_shim_text "$N_INSTALL" > "$BIN_DIR/$N_CLI.new" && chmod 755 "$BIN_DIR/$N_CLI.new" && mv -f "$BIN_DIR/$N_CLI.new" "$BIN_DIR/$N_CLI" || return 1
+    vn_cli_legacy_shim_text "$BIN_DIR/$N_CLI" > "$BIN_DIR/$O_CLI.new" && chmod 755 "$BIN_DIR/$O_CLI.new" && mv -f "$BIN_DIR/$O_CLI.new" "$BIN_DIR/$O_CLI"
 }
 step_layout(){      # the commit point: from here the bot and the scripts read the new names
     rm -f "$LAYOUT_FILE" 2>/dev/null
-    _aq_adopt_new_layout keepdb      # the data file keeps its name until the second move (deploy/migrate-db-name.sh) has renamed it
+    _vn_adopt_new_layout keepdb      # the data file keeps its name until the second move (deploy/migrate-db-name.sh) has renamed it
 }
 step_start(){
     sysd daemon-reload || return 1
@@ -193,7 +195,7 @@ do_rollback(){
     [ -e "$OI/main.py" ] && [ -e "$OD" ] || return 1
     guard_off      # the old state is whole again
     sysd start "$O_SERVICE" 2>/dev/null
-    [ -n "${AQ_MIG_NOBLOCK:-}" ] && return 0
+    [ -n "${VN_MIG_NOBLOCK:-}" ] && return 0
     nap 3
     sysd is-active --quiet "$O_SERVICE"
 }
@@ -208,7 +210,7 @@ fail(){   # fail REASON - put everything back, mark the box, leave
 run(){ STEP="$1"; set_state running "$STEP"; _inject "$STEP" || fail "step $STEP failed"; "step_$1" || fail "step $1 failed"; _inject "after_$1" || fail "step $1 failed afterwards"; }
 
 # ── start ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[ "$(id -u)" = 0 ] || [ -n "${AQ_TEST_NONROOT:-}" ] || { say "must run as root"; exit 10; }
+[ "$(id -u)" = 0 ] || [ -n "${VN_TEST_NONROOT:-}" ] || { say "must run as root"; exit 10; }
 STEP=start; TS="$(date +%Y%m%d-%H%M%S)"; export START_EPOCH; START_EPOCH="$(date +%s)"
 mkdir -p "$PREF_DIR" 2>/dev/null
 
@@ -229,7 +231,7 @@ fi
 layout_ok || { say "the layout file cannot be read or is not valid - not changed"; exit 10; }
 if [ "$FORCE" != 1 ]; then
     [ "$(get_state)" = failed ] && { say "this box is marked migrate-failed - not tried again by itself (apexquant --migrate-layout tries it on request)"; exit 13; }
-    if [ -e "$OPTOUT_FILE" ] || [ "${AQ_NO_MIGRATE_LAYOUT:-0}" = 1 ]; then say "opted out - the old names stay"; exit 12; fi
+    if [ -e "$OPTOUT_FILE" ] || [ "${VN_NO_MIGRATE_LAYOUT:-0}" = 1 ]; then say "opted out - the old names stay"; exit 12; fi
 fi
 [ -e "$OI/main.py" ] && [ -d "$OD" ] || { say "no installed bot found at $O_INSTALL / $O_DATA - nothing to move"; exit 10; }
 [ -e "$NI" ] || [ -L "$NI" ] || [ -e "$ND" ] || [ -L "$ND" ] && { say "$N_INSTALL or $N_DATA already exists - not changed"; exit 10; }

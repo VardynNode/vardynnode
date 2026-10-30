@@ -1,0 +1,55 @@
+[Unit]
+Description=VardynNode — Automated Trading Bot
+After=network-online.target
+Wants=network-online.target
+# 6.16.56: no start limit (as always): a unit that systemd stops after a few starts stays down until someone starts it, with nobody told. A restart loop is stopped by the watchdog's own pause instead (see below)
+StartLimitIntervalSec=0
+
+[Service]
+User=root
+WorkingDirectory=@VN_INSTALL_DIR@
+
+# Load secrets from .env — systemd reads this file BEFORE Python starts.
+# The running Python process never opens .env, eliminating path traversal risk.
+# Recommended: move .env outside the app directory for extra protection:
+#   mv @VN_INSTALL_DIR@/.env /root/.vn_env
+#   chmod 600 /root/.vn_env
+#   update EnvironmentFile= below accordingly
+EnvironmentFile=@VN_INSTALL_DIR@/.env
+
+ExecStart=@VN_INSTALL_DIR@/venv/bin/python3 @VN_INSTALL_DIR@/main.py
+
+Restart=always
+RestartSec=10
+# 6.16.56 (layer 2): the process pings systemd while its engine is alive (system/sdnotify.py); 180 s without a ping and systemd restarts it. A boot is pinged from its first line. The service type stays "simple"
+# on purpose: the unit is active the moment it starts, exactly as before, so an updater that checks "active" after a restart is not confused.
+NotifyAccess=main
+WatchdogSec=180
+# exit status 75 = the watchdog's circuit break (too many restarts): systemd starts the service again as for any exit; the NEW process waits five minutes before it starts trading (system/runstate.py), so a loop slows down
+# and the box is never down for good
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=@VN_SERVICE@
+
+MemoryMax=800M
+CPUQuota=80%
+TimeoutStopSec=30
+# 6.16.56: a normal stop (the stop signal, a successful stop) removes the "running" marker the next start reads: no Python signal handler is needed (one could hold a stop back); any other end leaves it, and the next start says so
+ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then rm -f "$$(dirname "$${VARDYNNODE_DB_PATH:-$${APEXQUANT_DB_PATH:-@VN_DATA_DIR@/@VN_DB_NAME@}}")/running.marker"; fi'
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
+@VN_ALIAS@
+
+# ── SETUP ────────────────────────────────────────────────────────────────────
+# (install.sh renders this template with the layout - deploy/layout.sh - and installs it; the @VN_...@ markers are filled in there)
+# systemctl daemon-reload
+# systemctl enable @VN_SERVICE@
+# systemctl start @VN_SERVICE@
+# systemctl status @VN_SERVICE@
+# journalctl -u @VN_SERVICE@ -f
+#
+# Manual run (without systemd):
+#   set -a && source .env && set +a && python3 main.py

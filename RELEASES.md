@@ -13,13 +13,13 @@ Every VardynNode package is published with a SHA-256 checksum and a minisign sig
 RWRHtMOGHSz0oywqtMdW5cQkw2UE1llujBPPnUFkW1RGaz9qRFZHZKSj
 ```
 
-This is the same key that is pinned inside the one-line installer and the updater (see `installer/deploy/get-apexquant.sh` and `installer/deploy/aq-update.sh`). It is the public key only.
+This is the same key that is pinned inside the one-line installer and the updater (see `installer/deploy/get-vardynnode.sh` and `installer/deploy/vn-update.sh`). It is the public key only.
 
 ## Check it with the script
 
 ```
-./verify.sh                       # downloads the package and checks it
-./verify.sh VardynNode-Setup.zip  # checks a file you already have
+bash verify.sh                       # downloads the package and checks it
+bash verify.sh VardynNode-Setup.zip  # checks a file you already have
 ```
 
 ## Or by hand

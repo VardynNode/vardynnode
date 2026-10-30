@@ -1,31 +1,34 @@
 #!/usr/bin/env bash
+# 7.3.38: the settings are called VN_<name>; the earlier AQ_<name> is still accepted until the sunset (BACKLOG row 17) (a caller that still sets it is mapped here; VN_ wins).
+_vn_env_compat() { local _v _n; for _v in $(compgen -v); do case "$_v" in AQ_*) _n="VN_${_v#AQ_}"; [ -n "${!_n:-}" ] || export "$_n=${!_v}";; esac; done; }; _vn_env_compat
 # migrate-common.sh (7.2.0) - what the two moves share: deploy/migrate-layout.sh (the folders, the service, the command) and deploy/migrate-db-name.sh (the data file name). Sourced by both, after deploy/layout.sh.
 # The caller sets: P (the test folder, empty on a real box), PREF_DIR, STATE (its journal file), TAG (the word in its lines), and START_EPOCH before the health check.
 
-P="${AQ_ROOT_PREFIX:-}"          # test seam: every file the scripts touch lives under this folder (empty on a real box)
-NAP_SEC="${AQ_MIG_NAP:-}"        # test seam: the length of every wait (seconds)
+P="${VN_ROOT_PREFIX:-}"          # test seam: every file the scripts touch lives under this folder (empty on a real box)
+NAP_SEC="${VN_MIG_NAP:-}"        # test seam: the length of every wait (seconds)
 say(){ echo "[${TAG:-MIGRATE}] $*" >&2; }
 nap(){ sleep "${NAP_SEC:-$1}"; }
 set_state(){   # set_state STATE STEP [REASON]
     mkdir -p "$PREF_DIR" 2>/dev/null || true
-    local r="${3:-}"; r="${r//$'\n'/ }"
-    printf 'state=%s\nstep=%s\nts=%s\nreason=%s\n' "$1" "${2:-}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$r" > "$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE" 2>/dev/null || true
+    local r="${3:-}" x=""; r="${r//$'\n'/ }"
+    [ -n "${MIG_REV:-}" ] && x="rev=$MIG_REV"$'\n'"ver=${MIG_VER:-}"$'\n'      # 7.3.39: a script that has a revision says which one wrote the mark (the others write none)
+    printf 'state=%s\nstep=%s\nts=%s\nreason=%s\n%s' "$1" "${2:-}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$r" "$x" > "$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE" 2>/dev/null || true
 }
 get_state(){ sed -n 's/^state=//p' "$STATE" 2>/dev/null | tail -n 1; }
 state_field(){ sed -n "s/^$1=//p" "$STATE" 2>/dev/null | tail -n 1; }
 # systemd: enable/disable work on the files (and with a test folder, inside it); the rest talks to the running manager
-sysd(){ if [ -n "${AQ_MIG_NOBLOCK:-}" ] && [ "${1:-}" = start ]; then shift; systemctl start --no-block "$@"; else systemctl "$@"; fi; }
+sysd(){ if [ -n "${VN_MIG_NOBLOCK:-}" ] && [ "${1:-}" = start ]; then shift; systemctl start --no-block "$@"; else systemctl "$@"; fi; }
 sysd_files(){ if [ -n "$P" ]; then systemctl --root="$P" "$@"; else systemctl "$@"; fi; }
-# failure injection, for the tests only (it is honoured only when a test folder is set): AQ_MIG_FAIL_AT=<step> makes that step fail, AQ_MIG_KILL_AT=<step> ends the script abruptly there
+# failure injection, for the tests only (it is honoured only when a test folder is set): VN_MIG_FAIL_AT=<step> makes that step fail, VN_MIG_KILL_AT=<step> ends the script abruptly there
 _inject(){
     [ -n "$P" ] || return 0
-    [ "${AQ_MIG_KILL_AT:-}" = "$1" ] && kill -9 $$
-    [ "${AQ_MIG_FAIL_AT:-}" = "$1" ] && return 1
+    [ "${VN_MIG_KILL_AT:-}" = "$1" ] && kill -9 $$
+    [ "${VN_MIG_FAIL_AT:-}" = "$1" ] && return 1
     return 0
 }
 
 # ── the data file, read through the bot's own Python (every box has it; the sqlite3 command is not installed everywhere) ───────────────────────────────────────────────────────────────────────────────────────
-mig_python(){ printf '%s' "${AQ_MIG_PYTHON:-$1/venv/bin/python3}"; }      # $1 = the install folder
+mig_python(){ printf '%s' "${VN_MIG_PYTHON:-$1/venv/bin/python3}"; }      # $1 = the install folder
 db_scalar(){   # db_scalar INSTALL_DIR DB "SQL": the first column of the first row, read-only; prints nothing when it cannot be read
     local py; py="$(mig_python "$1")"
     if [ -x "$py" ] || command -v "$py" >/dev/null 2>&1; then
@@ -49,7 +52,7 @@ pending_orders(){   # pending_orders INSTALL_DIR DB: the number of orders being 
 }
 export QUIET_WHY=""
 wait_quiet(){   # wait_quiet INSTALL_DIR DB: 0 when the bot is quiet. An order being placed is waited for a little; a restore waiting for review and a currency switch under way are not waited for (a later window). QUIET_WHY says what is going on.
-    local q=0 qmax="${AQ_MIG_QUIET_WAIT:-90}" ph dd; dd="$(dirname "$2")"
+    local q=0 qmax="${VN_MIG_QUIET_WAIT:-90}" ph dd; dd="$(dirname "$2")"
     if [ -e "$dd/RESTORE_PENDING" ]; then QUIET_WHY="a restore is waiting for review"; return 1; fi
     ph="$(db_scalar "$1" "$2" "SELECT json_extract(value, '\$.phase') FROM app_settings WHERE key='switch_currency_state'")"
     case "$ph" in pending_restart|winding_down) QUIET_WHY="a currency switch is under way"; return 1 ;; esac
@@ -60,7 +63,7 @@ wait_quiet(){   # wait_quiet INSTALL_DIR DB: 0 when the bot is quiet. An order b
     return 0
 }
 layout_ok(){   # the layout file, when there is one, is readable and every line is a comment, a blank or KEY=value (a known key, plain path characters)
-    local f line k v; f="$(aq_layout_file)"
+    local f line k v; f="$(vn_layout_file)"
     [ -e "$f" ] || return 0
     [ -r "$f" ] || return 1
     while IFS= read -r line || [ -n "$line" ]; do
@@ -97,7 +100,7 @@ RECOVER_UNIT="${LAY_NEW_SERVICE}-migrate-recover"
 guard_dropins(){      # [Unit] ConditionPathExists=!<guard file> for every name of the service (also its alias): the unit is skipped while the file exists
     local n g; g="$(guard_file)"; g="${g#"$P"}"
     for n in $GUARD_NAMES; do
-        mkdir -p "$UNIT_DIR/$n.service.d" && printf '[Unit]\nConditionPathExists=!%s\n' "$g" > "$UNIT_DIR/$n.service.d/00-aq-migrating.conf" || return 1
+        mkdir -p "$UNIT_DIR/$n.service.d" && printf '[Unit]\nConditionPathExists=!%s\n' "$g" > "$UNIT_DIR/$n.service.d/00-vn-migrating.conf" || return 1
     done
 }
 write_recover_script(){      # $1 = file: run at boot by the one-shot unit
@@ -109,18 +112,24 @@ H="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TAG="MIGRATE-RECOVER"
 # shellcheck source=migrate-common.sh
 . "$H/migrate-common.sh"
-PREF_DIR="${AQ_PREF_DIR:-$P$LAY_PREF_DIR}"; UNIT_DIR="${AQ_UNIT_DIR:-$P/etc/systemd/system}"
+PREF_DIR="${VN_PREF_DIR:-$P$LAY_PREF_DIR}"; UNIT_DIR="${VN_UNIT_DIR:-$P/etc/systemd/system}"
 GUARD_NAMES="$LAY_LEGACY_SERVICE $LAY_NEW_SERVICE"
-export AQ_MIG_NOBLOCK=1      # this runs before the service starts: a start is queued, never waited for
+export VN_MIG_NOBLOCK=1      # this runs before the service starts: a start is queued, never waited for
 for s in migrate-db-name migrate-layout; do
     if [ "$(sed -n 's/^state=//p' "$PREF_DIR/$s.state" 2>/dev/null | tail -n 1)" = running ]; then
         say "an earlier move was cut short - putting it right before the service starts"
         bash "$H/$s.sh"
     fi
 done
+# 7.3.38: the move of the state folder, backup folder, certificate folder and site keeps its journal in a folder that does not move
+NSD="$P$LAY_NAMES_STATE_DIR"
+if [ "$(sed -n 's/^state=//p' "$NSD/migrate-names.state" 2>/dev/null | tail -n 1)" = running ]; then
+    say "an earlier move of the system names was cut short - putting it right before the service starts"
+    bash "$H/migrate-names.sh"
+fi
 # nothing is left to put right (or it has been): the guard and this one-shot unit go
 guard_off
-case "$H" in "$PREF_DIR"/migrate-scripts) cd / && rm -rf "$H" ;; esac
+case "$H" in "$PREF_DIR"/migrate-scripts|"$NSD"/migrate-scripts) cd / && rm -rf "$H" ;; esac
 exit 0
 RECOVER
 }
@@ -141,7 +150,8 @@ guard_lift(){ rm -f "$(guard_file)"; }      # the state is whole again: the serv
 guard_off(){      # the move is finished or has been put back
     local n
     for n in $GUARD_NAMES; do
-        rm -f "$UNIT_DIR/$n.service.d/00-aq-migrating.conf"
+        rm -f "$UNIT_DIR/$n.service.d/00-vn-migrating.conf"
+        rm -f "$UNIT_DIR/$n.service.d/00-aq-migrating.conf"      # the drop-in of the move scripts before 7.3.38 (left behind by a move that was cut short under them)
         rmdir "$UNIT_DIR/$n.service.d" 2>/dev/null
     done
     sysd_files disable "$RECOVER_UNIT" >/dev/null 2>&1
@@ -192,7 +202,7 @@ verify_unit(){   # the real checker of systemd, when this box has it (a test fol
 
 # ── the health check: the service stays active, the dashboard answers, the running marker is fresh, the log shows no [FATAL] ──────────────────────────────────────────────────────────────────────────────
 dash_port(){ local p; p="$(grep -E '^DASHBOARD_PORT=' "$1/.env" 2>/dev/null | tail -n 1 | cut -d= -f2 | tr -d '"'"'"' \r')"; [[ "$p" =~ ^[0-9]+$ ]] && echo "$p" || echo 5005; }
-dash_answers(){ local c; c="$(curl -s -o /dev/null -m 8 -w '%{http_code}' "${AQ_MIG_HEALTH_URL:-http://127.0.0.1:$(dash_port "$1")/}" 2>/dev/null)"; [ -n "$c" ] && [ "$c" != 000 ]; }
+dash_answers(){ local c; c="$(curl -s -o /dev/null -m 8 -w '%{http_code}' "${VN_MIG_HEALTH_URL:-http://127.0.0.1:$(dash_port "$1")/}" 2>/dev/null)"; [ -n "$c" ] && [ "$c" != 000 ]; }
 marker_fresh(){   # marker_fresh DATA_DIR: the bot wrote its running marker after this run began
     local t; t="$(sed -n 's/.*"ts": *\([0-9]*\).*/\1/p' "$1/running.marker" 2>/dev/null | head -n 1)"
     [[ "$t" =~ ^[0-9]+$ ]] && [ "$t" -ge "$START_EPOCH" ]
@@ -202,7 +212,7 @@ log_fatal(){      # log_fatal SERVICE: a [FATAL] line in its log since the start
     journalctl -u "$1" --since "$(date -d "@$START_EPOCH" '+%Y-%m-%d %H:%M:%S')" --no-pager -q 2>/dev/null | grep -qF '[FATAL]'
 }
 mig_health(){   # mig_health SERVICE DATA_DIR HAD_MARKER(0|1): 0 when healthy
-    local svc="$1" dd="$2" had="$3" need="${AQ_MIG_HEALTH_CHECKS:-6}" max="${AQ_MIG_HEALTH_MAX:-24}" i good=0 dash=0 mark=0
+    local svc="$1" dd="$2" had="$3" need="${VN_MIG_HEALTH_CHECKS:-6}" max="${VN_MIG_HEALTH_MAX:-24}" i good=0 dash=0 mark=0
     for ((i=1; i<=max; i++)); do
         nap 5
         sysd is-active --quiet "$svc" || { say "the service is not active"; return 1; }

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# migrate-db-name.sh (7.2.0) - rename the data file apexquant.db -> vardynnode.db on a box that is already on the new folder names. Called by aq-update.sh AFTER the new version is installed and healthy
+# 7.3.38: the settings are called VN_<name>; the earlier AQ_<name> is still accepted until the sunset (BACKLOG row 17) (a caller that still sets it is mapped here; VN_ wins).
+_vn_env_compat() { local _v _n; for _v in $(compgen -v); do case "$_v" in AQ_*) _n="VN_${_v#AQ_}"; [ -n "${!_n:-}" ] || export "$_n=${!_v}";; esac; done; }; _vn_env_compat
+# migrate-db-name.sh (7.2.0) - rename the data file apexquant.db -> vardynnode.db on a box that is already on the new folder names. Called by vn-update.sh AFTER the new version is installed and healthy
 # (and by "apexquant --migrate-layout" after the folder move); safe to run again (a box that is already renamed does nothing).
 #
 #   why after the install: a version older than 7.1.4 names the data file in its own code. If the file were renamed under it, that version would open a NEW EMPTY database. The new version reads the name from the layout file.
@@ -16,16 +18,16 @@ export TAG="MIGRATE-DB"
 # shellcheck source=migrate-common.sh
 . "$HERE/migrate-common.sh"
 
-TPL="${AQ_UNIT_TEMPLATE:-$HERE/apexquant.service}"
-LAYOUT_FILE="$(aq_layout_file)"
-UNIT_DIR="${AQ_UNIT_DIR:-$P/etc/systemd/system}"
-PREF_DIR="${AQ_PREF_DIR:-$P$LAY_PREF_DIR}"
-BACKUP_ROOT="${AQ_BACKUP_ROOT:-$P$LAY_BACKUP_ROOT}"
+TPL="${VN_UNIT_TEMPLATE:-$HERE/vardynnode.service}"
+LAYOUT_FILE="$(vn_layout_file)"
+UNIT_DIR="${VN_UNIT_DIR:-$P/etc/systemd/system}"
+PREF_DIR="${VN_PREF_DIR:-$P$LAY_PREF_DIR}"
+BACKUP_ROOT="${VN_BACKUP_ROOT:-$P$LAY_BACKUP_ROOT}"
 export STATE; STATE="$PREF_DIR/migrate-db-name.state"      # (read by migrate-common.sh)
 JDIR="$PREF_DIR/migrate-db-name"
 SAVED="$JDIR/saved"
 OPTOUT_FILE="$PREF_DIR/no-migrate-layout"
-FORCE="${AQ_MIGRATE_FORCE:-0}"
+FORCE="${VN_MIGRATE_FORCE:-0}"
 
 O_DB="$LAY_LEGACY_DB_NAME"; N_DB="$LAY_NEW_DB_NAME"
 ID="$P$LAY_INSTALL_DIR"; DD="$P$LAY_DATA_DIR"; SVC="$LAY_SERVICE"
@@ -98,14 +100,14 @@ step_link(){      # the install folder's link to the data file
     rm -f "$ID/$O_DB"
     ln -sfn "$LAY_DATA_DIR/$N_DB" "$ID/$N_DB"
 }
-step_layout(){      # the commit point: from here the bot and the scripts read the new data file name
+step_layout(){      # the commit point: from here the bot and the scripts read the new data file name (7.3.38: the file is edited, not written again: the four names of deploy/migrate-names.sh stay if it has already run)
     local t="$LAYOUT_FILE.tmp.$$"
-    _aq_new_layout_text > "$t" && chmod 644 "$t" && mv -f "$t" "$LAYOUT_FILE" || { rm -f "$t"; return 1; }
-    _aq_layout_load
+    awk -v db="DB_NAME=$LAY_NEW_DB_NAME" '/^DB_NAME=/{next} {print} /^DATA_DIR=/{print db}' "$LAYOUT_FILE" > "$t" && chmod 644 "$t" && mv -f "$t" "$LAYOUT_FILE" || { rm -f "$t"; return 1; }
+    _vn_layout_load
 }
 step_unit(){      # the unit again (its stop command names the data file)
     local rdir src rc; rdir="$(mktemp -d)"; src="$rdir/$SVC.service"
-    aq_render_unit "$TPL" "$LAY_INSTALL_DIR" "$LAY_DATA_DIR" "$N_DB" "$SVC" > "$src" && [ -s "$src" ] || { rm -rf "$rdir"; return 1; }
+    vn_render_unit "$TPL" "$LAY_INSTALL_DIR" "$LAY_DATA_DIR" "$N_DB" "$SVC" > "$src" && [ -s "$src" ] || { rm -rf "$rdir"; return 1; }
     verify_unit "$src" || { say "the new service unit did not pass systemd's check"; rm -rf "$rdir"; return 1; }
     cp -a "$UNIT_DIR/$SVC.service" "$UNIT_DIR/$SVC.service.prev" 2>/dev/null
     cp "$src" "$UNIT_DIR/$SVC.service.new" && chmod 644 "$UNIT_DIR/$SVC.service.new" && mv -f "$UNIT_DIR/$SVC.service.new" "$UNIT_DIR/$SVC.service"
@@ -146,7 +148,7 @@ do_rollback(){
     [ -e "$DD/$O_DB" ] || return 1
     guard_off      # the old state is whole again
     sysd start "$SVC" 2>/dev/null
-    [ -n "${AQ_MIG_NOBLOCK:-}" ] && return 0
+    [ -n "${VN_MIG_NOBLOCK:-}" ] && return 0
     nap 3
     sysd is-active --quiet "$SVC"
 }
@@ -161,7 +163,7 @@ fail(){
 run(){ STEP="$1"; set_state running "$STEP"; _inject "$STEP" || fail "step $STEP failed"; "step_$1" || fail "step $1 failed"; _inject "after_$1" || fail "step $1 failed afterwards"; }
 
 # ── start ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-[ "$(id -u)" = 0 ] || [ -n "${AQ_TEST_NONROOT:-}" ] || { say "must run as root"; exit 10; }
+[ "$(id -u)" = 0 ] || [ -n "${VN_TEST_NONROOT:-}" ] || { say "must run as root"; exit 10; }
 STEP=start; TS="$(date +%Y%m%d-%H%M%S)"; export START_EPOCH; START_EPOCH="$(date +%s)"      # (START_EPOCH is read by migrate-common.sh)
 mkdir -p "$PREF_DIR" 2>/dev/null
 
@@ -171,23 +173,28 @@ if [ "$(get_state)" = running ]; then      # an earlier run was cut short: put e
     if do_rollback; then scripts_cleanup; set_state failed "$STEP" "interrupted"; say "everything is back as it was; this box is marked migrate-failed"; exit 1; fi
     set_state failed "$STEP" "interrupted (rollback incomplete - manual attention)"; exit 2
 fi
+# 7.3.38: the layout file written by the folder move, with or without the four names that deploy/migrate-names.sh adds (it may have run first)
+layout_shape_ok(){
+    local cur; cur="$(cat "$LAYOUT_FILE")"
+    [ "$cur" = "$(_vn_new_layout_text keepdb)" ] || [ "$cur" = "$(_vn_new_layout_text keepdb; printf '%s\n' "PREF_DIR=$LAY_NEW_PREF_DIR" "BACKUP_ROOT=$LAY_NEW_BACKUP_ROOT" "NGINX_SITE=$LAY_NEW_NGINX_SITE" "SSL_DIR=$LAY_NEW_SSL_DIR")" ]
+}
 if [ "$LAY_DB_NAME" = "$N_DB" ]; then
     [ "$(get_state)" = "done" ] || set_state "done" "already" "already on the new data file name"
     say "the data file already has the new name; it was left as it is"; exit 0
 fi
 if [ "$LAY_INSTALL_DIR" != "$LAY_NEW_INSTALL_DIR" ] || [ "$LAY_DATA_DIR" != "$LAY_NEW_DATA_DIR" ] || [ "$LAY_SERVICE" != "$LAY_NEW_SERVICE" ] || [ "$LAY_DB_NAME" != "$O_DB" ] || [ ! -f "$LAYOUT_FILE" ] \
-   || [ "$(cat "$LAYOUT_FILE")" != "$(_aq_new_layout_text keepdb)" ]; then
+   || ! layout_shape_ok; then
     say "this box is not on the new folder names (or has its own layout) - the data file keeps its name"; exit 10
 fi
 layout_ok || { say "the layout file cannot be read or is not valid - not changed"; exit 10; }
 if [ "$FORCE" != 1 ]; then
     [ "$(get_state)" = failed ] && { say "this box is marked migrate-failed - not tried again by itself (apexquant --migrate-layout tries it on request)"; exit 13; }
-    if [ -e "$OPTOUT_FILE" ] || [ "${AQ_NO_MIGRATE_LAYOUT:-0}" = 1 ]; then say "opted out - the data file keeps its name"; exit 12; fi
+    if [ -e "$OPTOUT_FILE" ] || [ "${VN_NO_MIGRATE_LAYOUT:-0}" = 1 ]; then say "opted out - the data file keeps its name"; exit 12; fi
 fi
 ls "$ID"/core/layout.* >/dev/null 2>&1 || { say "the installed version does not read the layout file yet - the data file keeps its name"; exit 10; }
 [ -f "$DD/$O_DB" ] && [ ! -L "$DD/$O_DB" ] || { say "no data file $O_DB in $LAY_DATA_DIR (or it is a link) - nothing to rename"; exit 10; }
 if [ -e "$DD/$N_DB" ] || [ -L "$DD/$N_DB" ]; then say "$N_DB already exists in $LAY_DATA_DIR - not changed"; exit 10; fi
-_envpath="$(aq_env_file_get DB_PATH "$DD/.env")"      # 7.3.2: VARDYNNODE_DB_PATH first, then APEXQUANT_DB_PATH
+_envpath="$(vn_env_file_get DB_PATH "$DD/.env")"      # 7.3.2: VARDYNNODE_DB_PATH first, then APEXQUANT_DB_PATH
 if [ -n "$_envpath" ] && [ "$_envpath" != "$LAY_DATA_DIR/$O_DB" ] && [ "$_envpath" != "$LAY_LEGACY_DATA_DIR/$O_DB" ]; then say "the data file path is set to its own value in .env - not changed"; exit 10; fi
 _need=$(( $(du -sk "$DD" 2>/dev/null | cut -f1) * 2 + 1024 )); _have="$(df -Pk "$(dirname "$BACKUP_ROOT")" 2>/dev/null | awk 'NR==2{print $4}')"
 if [[ "$_have" =~ ^[0-9]+$ ]] && [ "$_have" -lt "$_need" ]; then say "not enough free space for the backup - not changed"; exit 10; fi

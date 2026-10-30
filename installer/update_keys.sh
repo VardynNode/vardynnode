@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# update_keys.sh — 5.23.0-fix20: Safe Binance API key update for ApexQuant.
+# 7.3.38: the settings are called VN_<name>; the earlier AQ_<name> is still accepted until the sunset (BACKLOG row 17) (a caller that still sets it is mapped here; VN_ wins).
+_vn_env_compat() { local _v _n; for _v in $(compgen -v); do case "$_v" in AQ_*) _n="VN_${_v#AQ_}"; [ -n "${!_n:-}" ] || export "$_n=${!_v}";; esac; done; }; _vn_env_compat
+# update_keys.sh — 5.23.0-fix20: Safe Binance API key update for VardynNode.
 # 7.3.25: the cleared marker must be fresh (no older than an hour) and clean (no order left open); the new keys are checked against the exchange (read-only) BEFORE anything is written;
 #         the override is written to a file the next start reads and logs (the old text promised a log line that nothing wrote).
 # ============================================================================
@@ -27,7 +29,7 @@ if [ ! -f "$ENV_FILE" ] && [ -f "$APP_DIR/.env" ]; then
 fi
 MARKER="$DATA_DIR/.switch_cleared"
 OVERRIDE_FILE="$DATA_DIR/.switch_override"
-MARKER_MAX_AGE="${AQ_MARKER_MAX_AGE:-3600}"
+MARKER_MAX_AGE="${VN_MARKER_MAX_AGE:-3600}"
 
 echo ""
 echo "================================================================"
@@ -115,7 +117,7 @@ fi
 # 7.3.25: the new keys are checked against the exchange (one read-only call: the account) BEFORE anything is written. The keys go to the checker in its environment, never on a command line.
 CHECK_MODE="$(grep -E '^TRADING_MODE=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr '[:lower:]' '[:upper:]' || true)"
 if [ "$CHECK_MODE" = "TESTNET" ]; then CHECK_BASE_DEFAULT="https://testnet.binance.vision"; else CHECK_BASE_DEFAULT="https://api.binance.com"; fi
-CHECK_BASE="${AQ_BINANCE_BASE:-$CHECK_BASE_DEFAULT}"
+CHECK_BASE="${VN_BINANCE_BASE:-$CHECK_BASE_DEFAULT}"
 KEY_VERDICT=$(AQK="$NEW_KEY" AQS="$NEW_SECRET" AQB="$CHECK_BASE" python3 - <<'PYEOF' 2>/dev/null || echo "unreachable"
 import hmac, hashlib, json, os, time, urllib.request, urllib.error
 base = os.environ["AQB"].rstrip("/")
