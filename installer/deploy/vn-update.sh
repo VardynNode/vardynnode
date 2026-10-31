@@ -119,9 +119,10 @@ SKIP_ON_OPEN="${VN_SKIP_ON_OPEN_POSITIONS:-1}"          # LIVE: defer update whi
 ZIP_NAMES="${VN_ZIP_NAMES:-VardynNode-Setup.zip ApexQuant-Setup.zip}"      # 7.2.0: the package is published under both names (copies, each with its own checksum and signature); the new name is tried first at each origin, the old name is the fallback. Older updaters only know the old one
 
 log(){ echo "$(date -u '+%F %T') UTC  $*" | tee -a "$LOG" >&2; }
-die(){ log "ERROR: $*"; _write_status failed "$*"; exit 1; }      # 6.16.56: a failed run says so on the dashboard (it kept showing the last "success")
+die(){ log "ERROR: $*"; _write_status failed "$*"; [ -z "${PREF_DIR:-}" ] || rm -f "$PREF_DIR/update-run.state" 2>/dev/null; exit 1; }      # 6.16.56: a failed run says so on the dashboard (it kept showing the last "success")
 warn(){ log "WARN: $*"; }
 _write_status(){   # $1=state  $2=detail  — durable handoff to the bot dashboard (decoupled). 7.3.36 (install F6): written with python3's own sqlite3 module (the sqlite3 command-line tool is not installed on a fresh server)
+    _STATUS_WRITTEN=1      # 7.3.40: the cut-short trap (below) writes its own row only when this run has written none
     [ -n "${DB_PATH:-}" ] && command -v python3 >/dev/null 2>&1 || return 0
     VN_ST="${1:-}" VN_DT="${2:-}" VN_FV="${_from_ver:-}" VN_TV="${_target_ver:-}" VN_PKG="$(short "${REMOTE_SHA:-}")" VN_TS="$(date -u '+%Y-%m-%d %H:%M:%S')" python3 - "$DB_PATH" <<'PYST' 2>/dev/null || true
 import os, sqlite3, sys
@@ -276,14 +277,17 @@ enable_auto(){  install_self; move_update_units
 disable_auto(){ install_self
     local _u; for _u in "$LAY_UPDATE_UNIT" "$LAY_LEGACY_UPDATE_UNIT"; do      # (7.3.38: both names: a box may still have the earlier pair)
         systemctl disable --now ${_u}.timer 2>/dev/null || true
-        rm -f $UNIT_DIR/${_u}.timer $UNIT_DIR/${_u}.service
+        rm -f $UNIT_DIR/${_u}.timer; if ! _unit_busy "$_u"; then rm -f $UNIT_DIR/${_u}.service; fi      # (7.3.40: not the file of the service this run is inside)
     done
     systemctl daemon-reload; save_pref off; log "auto-update DISABLED"; }
 
 # 7.3.38: the update timer and its service were called apexquant-update; they are called vardynnode-update now ($LAY_UPDATE_UNIT). A box that still has the earlier pair is moved here, at the start of every run and whenever
 # auto-update is turned on: the earlier timer is stopped FIRST (two timers never run side by side), the new pair is written and started, then the earlier timer is disabled and its files removed. A step that fails puts the
-# earlier pair back as it was (enabled and running as before) and the move is tried again at the next run. The earlier SERVICE is only removed, never stopped: a run that this service started would end itself.
+# earlier pair back as it was (enabled and running as before) and the move is tried again at the next run. The earlier SERVICE is never stopped, and while a run is inside it its file is NOT removed (7.3.40: removing it killed the running update after 90 seconds); the next run removes it.
 _ut(){ systemctl "$@" >/dev/null 2>&1; }
+# 7.3.40: is THIS run executing inside that service? (a oneshot service that is running reads "activating", a finished one "inactive"). Its unit file must stay on disk then: when the file of a running
+# service is removed and systemd reloads, the running job loses its settings, the 90-second default start timeout applies and systemd kills the whole run (LIVE, 31 Oct, 04:53:35 -> 04:55:05).
+_unit_busy(){ local st; st="$(systemctl is-active "$1.service" 2>/dev/null || true)"; case "$st" in active|activating|reloading) return 0;; esac; return 1; }
 _ut_putback(){   # _ut_putback EARLIER NEW BACKUP_FOLDER WAS_ENABLED WAS_ACTIVE
     _ut disable --now "$2.timer"; rm -f "$UNIT_DIR/$2.timer" "$UNIT_DIR/$2.service"
     cp -a "$3/." "$UNIT_DIR/"; systemctl daemon-reload 2>/dev/null
@@ -297,8 +301,9 @@ move_update_units(){
     [ -e "$UNIT_DIR/$old.timer" ] || [ -e "$UNIT_DIR/$old.service" ] || return 0
     systemctl is-enabled --quiet "$old.timer" 2>/dev/null && en=1
     systemctl is-active --quiet "$old.timer" 2>/dev/null && on=1
+    local keepsvc=0; if _unit_busy "$old"; then keepsvc=1; fi      # 7.3.40: this run is inside the earlier service: its file stays until a later run (under the new service) removes it
     if [ "$en" = 0 ] && [ "$on" = 0 ]; then      # the earlier pair is there but nothing turns it on (a left-over): it is removed, no new timer is started
-        rm -f "$UNIT_DIR/$old.timer" "$UNIT_DIR/$old.service"; systemctl daemon-reload 2>/dev/null; log "update timer: removed the left-over $old pair (it was not turned on)"; return 0
+        rm -f "$UNIT_DIR/$old.timer"; if [ "$keepsvc" = 0 ]; then rm -f "$UNIT_DIR/$old.service"; fi; systemctl daemon-reload 2>/dev/null; log "update timer: removed the left-over $old pair (it was not turned on)"; return 0
     fi
     bk="$(mktemp -d)" || return 0
     cp -a "$UNIT_DIR/$old.timer" "$bk/" 2>/dev/null; if [ -e "$UNIT_DIR/$old.service" ]; then cp -a "$UNIT_DIR/$old.service" "$bk/"; fi
@@ -310,13 +315,61 @@ move_update_units(){
     if ! _ut disable "$old.timer"; then
         _ut_putback "$old" "$new" "$bk" "$en" "$on"; warn "update timer: the earlier timer ($old) could not be turned off - it is back as it was; the move is tried again at the next run"; return 0
     fi
-    rm -f "$UNIT_DIR/$old.timer" "$UNIT_DIR/$old.service"
-    if [ -e "$UNIT_DIR/$old.timer" ] || [ -e "$UNIT_DIR/$old.service" ]; then
+    rm -f "$UNIT_DIR/$old.timer"; if [ "$keepsvc" = 0 ]; then rm -f "$UNIT_DIR/$old.service"; fi
+    if [ -e "$UNIT_DIR/$old.timer" ] || { [ "$keepsvc" = 0 ] && [ -e "$UNIT_DIR/$old.service" ]; }; then
         _ut_putback "$old" "$new" "$bk" "$en" "$on"; warn "update timer: the earlier files could not be removed - they are back as they were; the move is tried again at the next run"; return 0
     fi
     systemctl daemon-reload 2>/dev/null; rm -rf "$bk"
-    log "update timer: moved from $old to $new (one timer, running)"
+    if [ "$keepsvc" = 1 ]; then log "update timer: moved from $old to $new (one timer, running); the earlier service file stays until the next run (this run is inside it)"; else log "update timer: moved from $old to $new (one timer, running)"; fi
     return 0
+    return 0
+}
+
+# 7.3.40: THE UPDATE RUN CAN BE CUT SHORT (LIVE, 31 Oct: the run was killed after the installer's restart and before the success tail, so no status row, no counted update, no clean-up).
+#  * the run notes where it is in $PREF_DIR/update-run.state (stage=installing before the install step, stage=installed once the installer returned OK);
+#  * a TERM / HUP / INT while an update is under way writes the plain row "interrupted" (the dashboard says so, no alarm) if the run wrote no row of its own;
+#  * the success tail is ONE ordered block (finish_success) that can run again: package marker, deferral file, the count, the clean-up of old copies, the status row, the data-file rename, and last the run state;
+#  * the NEXT run finishes an interrupted run whose installer had finished and whose bot is healthy on the new version WITHOUT installing the package again (resume_interrupted). Whose installer was not known to have
+#    finished (stage=installing) is installed again by the normal flow, because its package marker was never written: the installer is idempotent, and nothing is guessed about a half-run installer.
+_STATUS_WRITTEN=0; _RUN_ACTIVE=0
+_rs(){ printf '%s' "${PREF_DIR:-${LAY_PREF_DIR:-/tmp}}/update-run.state"; }
+_state_put(){ local f; f="$(_rs)"; mkdir -p "$(dirname "$f")" 2>/dev/null; printf '%s\n' "$@" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" 2>/dev/null || true; }
+_state_get(){ sed -n "s/^$1=//p" "$(_rs)" 2>/dev/null | head -1; }
+_cut_short(){
+    trap '' TERM HUP INT
+    log "the update run was cut short ($1)"
+    if [ "${_RUN_ACTIVE:-0}" = 1 ] && [ "${_STATUS_WRITTEN:-0}" != 1 ]; then
+        _write_status interrupted "The last update was interrupted before it finished; it is completed at the next daily check."
+    fi
+    exit 143
+}
+trap '_cut_short TERM' TERM; trap '_cut_short HUP' HUP; trap '_cut_short INT' INT
+healthy(){ systemctl is-active --quiet "$SERVICE" || return 1
+    [ -z "$HEALTH_URL" ] || curl -fsS --max-time 8 "$HEALTH_URL" >/dev/null 2>&1 || return 1; return 0; }
+finish_success(){   # $1 = package sha, $2 = the status detail. Ordered; every step can be repeated.
+    echo "$1" > "$SHA_STATE"; rm -f "$DEFER_FILE"
+    ping_update "$(short "$1")"
+    prune_copies      # 6.16.58: the one retention rule (this run's snapshot and the previous install are the newest and stay)
+    _write_status success "$2"
+    log "update applied — new code staged + healthy ${VN_HEALTH_WINDOW_CHECKS:-6}x5s, counted (pkg $(short "$1"))"
+    rename_db_installed || return 1      # 7.2.0: the data file takes the new name now that the new version runs (a failure puts it back and leaves the update as it is)
+    rm -f "$(_rs)"
+    return 0
+}
+resume_interrupted(){
+    local f; f="$(_rs)"; [ -f "$f" ] || return 0
+    local stage sha tgt frm now_ver
+    stage="$(_state_get stage)"; sha="$(_state_get sha)"; tgt="$(_state_get target)"; frm="$(_state_get from)"
+    now_ver="$( (cd "$INSTALL_DIR" && ./venv/bin/python -c 'import core.version as v; print(v.BUILD_PHASE)') 2>/dev/null | tail -1 )"
+    if [ "$stage" = installed ] && [ -n "$sha" ] && [ -n "$now_ver" ] && [ "$now_ver" = "$tgt" ] && healthy; then
+        log "an earlier update run was cut short after its installer finished (pkg $(short "$sha")); the bot is healthy on $now_ver - the rest is completed now, the package is not installed again"
+        local REMOTE_SHA="$sha" _from_ver="$frm" _target_ver="$tgt"
+        finish_success "$sha" "Updated and healthy (finished at the next check)" || exit 1
+        log "the interrupted update is complete; the next daily check looks for anything newer"
+        exit 0      # this run ends here: the row just written says what happened (a check in the same run would overwrite it)
+    fi
+    log "an earlier update run was cut short before it was known to be complete (stage ${stage:-?}); the update is repeated by this run"
+    rm -f "$f"; return 0
 }
 
 prompt_pref(){
@@ -620,7 +673,7 @@ command -v unzip >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get insta
 command -v unzip >/dev/null 2>&1 || die "unzip not available (apt-get install unzip)"
 
 _from_ver="$( (cd "$INSTALL_DIR" && ./venv/bin/python -c 'import core.version as v; print(v.BUILD_PHASE)') 2>/dev/null | tail -1 )"
-select_unit || true; LOCAL_SHA="$(cat "$SHA_STATE" 2>/dev/null || echo "")"
+select_unit || true; resume_interrupted; LOCAL_SHA="$(cat "$SHA_STATE" 2>/dev/null || echo "")"
 if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$LOCAL_SHA" ]; then
     log "already current (pkg $(short "$REMOTE_SHA")) — no update, not counted"
     _write_status checked_no_update "Already up to date"
@@ -722,6 +775,8 @@ maybe_move_names "$STAGE_TOP/deploy" || { rm -rf "$STAGE"; exit 1; }      # 7.3.
 
 # 3) STAGE — config/db snapshot, then rename current install aside as OLD (secret source + rollback)
 OLD_DIR="${INSTALL_DIR}.OLD-$TS"
+_state_put stage=installing "sha=$REMOTE_SHA" "old=$OLD_DIR" "ts=$TS" "from=$_from_ver" target=
+_STATUS_WRITTEN=0; _RUN_ACTIVE=1      # 7.3.40: from here a cut-short run says so (see _cut_short)
 mark_updating
 systemctl stop "$SERVICE" 2>/dev/null || true
 rm -f "$UNIT_DIR/$SERVICE.service.prev"      # 6.16.56: only a unit saved by THIS run's installer may be put back on a rollback
@@ -750,9 +805,7 @@ cat "$INST_LOG" >> "$LOG" 2>/dev/null || true; rm -f "$INST_LOG"
 restore_config "$SNAP"
 # 7.3.25: the version being installed is read AGAIN now that the installer has built the venv (the read above ran before it existed on a real box, so the status recorded an empty target)
 [ -n "$_target_ver" ] || _target_ver="$( (cd "$INSTALL_DIR" && ./venv/bin/python -c 'import core.version as v; print(v.BUILD_PHASE)') 2>/dev/null | tail -1 )"
-
-healthy(){ systemctl is-active --quiet "$SERVICE" || return 1
-    [ -z "$HEALTH_URL" ] || curl -fsS --max-time 8 "$HEALTH_URL" >/dev/null 2>&1 || return 1; return 0; }
+if [ "$INSTALLER_FAILED" = 0 ]; then _state_put stage=installed "sha=$REMOTE_SHA" "old=$OLD_DIR" "ts=$TS" "from=$_from_ver" "target=$_target_ver"; fi      # 7.3.40: the installer returned OK
 
 # 6) SUSTAINED health — must stay up through the window (catches a delayed FATAL gate)
 _stayed_up=1
@@ -761,15 +814,10 @@ for _i in $(seq 1 "${VN_HEALTH_WINDOW_CHECKS:-6}"); do
     if [ "$INSTALLER_FAILED" = 1 ] || ! healthy; then _stayed_up=0; break; fi
 done
 if [ "$INSTALLER_FAILED" = 0 ] && [ "$_stayed_up" = 1 ]; then
-    echo "$REMOTE_SHA" > "$SHA_STATE"; rm -f "$DEFER_FILE"
     # version is baked into the compiled core/version.so — read it via the bot's venv
     _ver="$( (cd "$INSTALL_DIR" && ./venv/bin/python -c 'import core.version as v; print(v.BUILD_PHASE)') 2>/dev/null | tail -1 )"
     [ -z "$_ver" ] && _ver="$(short "$REMOTE_SHA")"
-    ping_update "$(short "$REMOTE_SHA")"
-    prune_copies      # 6.16.58: the one retention rule (this run's snapshot and the previous install are the newest and stay)
-    _write_status success "Updated and healthy"
-    log "update applied — new code staged + healthy ${VN_HEALTH_WINDOW_CHECKS:-6}x5s, counted (pkg $(short "$REMOTE_SHA"))"
-    rename_db_installed || exit 1      # 7.2.0: the data file takes the new name now that the new version runs (a failure puts it back and leaves the update as it is)
+    finish_success "$REMOTE_SHA" "Updated and healthy" || exit 1      # 7.3.40: the ordered tail (package marker, count, clean-up, status row, data-file rename, run state)
     printf "\n\033[32m===================================================\n"
     printf "  \342\234\224 UPDATE SUCCESSFUL\n"
     printf "  You are running VardynNode %s now.\n" "$_ver"
@@ -784,6 +832,7 @@ fi
 
 # 7) ROLLBACK — swap the real previous install back
 log "update unhealthy (installer_failed=$INSTALLER_FAILED) — rolling back to $OLD_DIR"
+rm -f "$(_rs)"      # 7.3.40: a rolled-back run is not resumed
 if [ -d "$OLD_DIR" ]; then
     rm -rf "${INSTALL_DIR}.failed-$TS" 2>/dev/null || true
     mv "$INSTALL_DIR" "${INSTALL_DIR}.failed-$TS" 2>/dev/null || true
