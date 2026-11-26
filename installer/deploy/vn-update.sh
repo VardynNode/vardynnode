@@ -100,12 +100,15 @@ REQUIRED_PYTHON="${VN_REQUIRED_PYTHON:-python3.12}"
 SELF_PATH="${VN_SELF_PATH:-/usr/local/bin/vn-update.sh}"
 derive_pref(){      # 7.3.38: a function, so the move of the state and backup folders can load the layout again
     PREF_DIR="${VN_PREF_DIR:-${VN_ROOT_PREFIX:-}$LAY_PREF_DIR}"; PREF_FILE="$PREF_DIR/auto-update"; SHA_STATE="$PREF_DIR/installed.sha256"
-    DEFER_FILE="$PREF_DIR/deferrals"                         # consecutive windows an update was held back for open positions
+    DEFER_FILE="$PREF_DIR/deferrals"                         # (retired in 8.0.17: the earlier 3-window counter; removed when a run finds it)
+    PENDING_FILE="$PREF_DIR/pending"                         # 8.0.17: an update is waiting for a risk to clear (since when, how many re-checks saw it, the reason)
     MIGRATE_OPTOUT="$PREF_DIR/no-migrate-layout"             # 7.2.0: this file keeps the box on the old folder names (vardynnode --no-migrate-layout makes it)
     BACKUP_ROOT="${VN_BACKUP_ROOT:-${VN_ROOT_PREFIX:-}$LAY_BACKUP_ROOT}"
 }
 derive_pref
-MAX_DEFERRALS="${VN_MAX_DEFERRALS:-3}"
+WAIT_MAX_TICKS="${VN_WAIT_MAX_TICKS:-720}"               # 8.0.17: after this many re-checks (2 minutes each: 24 hours) that still found a risk the update is installed anyway, and the reason is said
+RETRY_AFTER_SEC="${VN_WAIT_RETRY_SEC:-600}"              # 8.0.17: a downloaded package put down again because of a risk is not fetched again sooner than this
+WAIT_BACKSTOP_SEC="${VN_WAIT_BACKSTOP_SEC:-172800}"      # 8.0.17: and never later than 48 hours by the clock, however few re-checks ran
 UNIT_DIR="${VN_UNIT_DIR:-/etc/systemd/system}"
 KEEP_SNAPSHOTS="${VN_KEEP_SNAPSHOTS:-3}"                  # 6.16.58: the newest updater snapshots that stay (the bot reads the same defaults: core/retention.py)
 KEEP_COPIES="${VN_KEEP_COPIES:-2}"                        # 6.16.58: the newest previous installs that stay
@@ -115,11 +118,11 @@ MINISIGN_PUB="RWRHtMOGHSz0oywqtMdW5cQkw2UE1llujBPPnUFkW1RGaz9qRFZHZKSj"
 LOG="${VN_LOG:-/var/log/vn-update.log}"; LOCK="${VN_LOCK:-/var/lock/vn-update.lock}"
 if [ -z "${VN_LOG:-}" ] && [ -f /var/log/aq-update.log ] && [ ! -e /var/log/vn-update.log ]; then mv /var/log/aq-update.log /var/log/vn-update.log 2>/dev/null || true; fi      # 7.3.38: the log of the earlier name is carried over once
 PRESERVE=(".env" ".aql_key" ".aql_install")      # 6.16.61 (H1): license/aql_pubkey.py is NOT kept across an update: the package carries the key the release build trusts, and its copy is the one installed (install.sh adopt_package_pubkey)
-SKIP_ON_OPEN="${VN_SKIP_ON_OPEN_POSITIONS:-1}"          # LIVE: defer update while positions are open
+SKIP_ON_OPEN="${VN_SKIP_ON_OPEN_POSITIONS:-1}"          # LIVE: wait while something is at risk right now; 0 = install now (the owner's override)
 ZIP_NAMES="${VN_ZIP_NAMES:-VardynNode-Setup.zip ApexQuant-Setup.zip}"      # 7.2.0: the package is published under both names (copies, each with its own checksum and signature); the new name is tried first at each origin, the old name is the fallback. Older updaters only know the old one
 
 log(){ echo "$(date -u '+%F %T') UTC  $*" | tee -a "$LOG" >&2; }
-die(){ log "ERROR: $*"; _write_status failed "$*"; [ -z "${PREF_DIR:-}" ] || rm -f "$PREF_DIR/update-run.state" 2>/dev/null; exit 1; }      # 6.16.56: a failed run says so on the dashboard (it kept showing the last "success")
+die(){ log "ERROR: $*"; _write_status failed "$*"; if [ -n "${PREF_DIR:-}" ]; then rm -f "$PREF_DIR/update-run.state" 2>/dev/null; [ ! -f "$PREF_DIR/pending" ] || mv -f "$PREF_DIR/pending" "$PREF_DIR/pending.kept" 2>/dev/null; fi; exit 1; }      # 6.16.56: a failed run says so on the dashboard (it kept showing the last "success")
 warn(){ log "WARN: $*"; }
 _write_status(){   # $1=state  $2=detail  — durable handoff to the bot dashboard (decoupled). 7.3.36 (install F6): written with python3's own sqlite3 module (the sqlite3 command-line tool is not installed on a fresh server)
     _STATUS_WRITTEN=1      # 7.3.40: the cut-short trap (below) writes its own row only when this run has written none
@@ -243,6 +246,49 @@ self_refresh(){
     rm -f "$v"
 }
 
+# 8.0.17: the re-check: every 2 minutes, silent and without any network use unless an update is waiting (PENDING_FILE). A separate timer, so a wait survives a restart of the server and holds no lock between checks.
+write_wait_units(){
+    mkdir -p "$UNIT_DIR"
+    cat > $UNIT_DIR/${LAY_UPDATE_UNIT}-wait.service <<UNIT
+[Unit]
+Description=VardynNode update: look again whether a waiting update can install
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/grep -qF -e '--recheck)' $SELF_PATH
+ExecStart=$SELF_PATH --recheck
+UNIT
+    cat > $UNIT_DIR/${LAY_UPDATE_UNIT}-wait.timer <<UNIT
+[Unit]
+Description=Look every 2 minutes whether a waiting VardynNode update can install
+
+[Timer]
+OnActiveSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+end_wait(){      # nothing waits any more: the waiting state and the 2-minute timer go (the timer exists only while an update waits); silent, safe to call at any time. "park": the since-when is kept for the next hold
+    if [ "${1:-}" = park ]; then [ ! -f "$PENDING_FILE" ] || mv -f "$PENDING_FILE" "$PENDING_FILE.kept" 2>/dev/null || true; else rm -f "$PENDING_FILE" "$PENDING_FILE.kept" 2>/dev/null || true; fi
+    local u="${LAY_UPDATE_UNIT}-wait"
+    [ -e "$UNIT_DIR/$u.timer" ] || return 0
+    systemctl disable --now "$u.timer" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$u.timer"; if ! _unit_busy "$u"; then rm -f "$UNIT_DIR/$u.service"; fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+drop_wait(){      # automatic updates are off: a waiting update is not looked at again, and the status says so
+    [ ! -f "$PENDING_FILE" ] || _write_status skipped "Not installed yet - automatic updates are off: run the update again later."
+    end_wait
+}
+ensure_wait_timer(){      # started at the first wait (also on a box whose units were written before the re-check existed); it survives a restart of the server
+    local u="${LAY_UPDATE_UNIT}-wait"
+    [ -f "$UNIT_DIR/$u.timer" ] && [ -f "$UNIT_DIR/$u.service" ] && systemctl is-active --quiet "$u.timer" 2>/dev/null && return 0
+    write_wait_units; systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now "$u.timer" 2>/dev/null || warn "the 2-minute re-check could not be started; the update is looked at again at the next daily check"
+}
 write_units(){
     mkdir -p "$UNIT_DIR"
     cat > $UNIT_DIR/${LAY_UPDATE_UNIT}.service <<UNIT
@@ -279,6 +325,7 @@ disable_auto(){ install_self
         systemctl disable --now ${_u}.timer 2>/dev/null || true
         rm -f $UNIT_DIR/${_u}.timer; if ! _unit_busy "$_u"; then rm -f $UNIT_DIR/${_u}.service; fi      # (7.3.40: not the file of the service this run is inside)
     done
+    drop_wait
     systemctl daemon-reload; save_pref off; log "auto-update DISABLED"; }
 
 # 7.3.38: the update timer and its service were called apexquant-update; they are called vardynnode-update now ($LAY_UPDATE_UNIT). A box that still has the earlier pair is moved here, at the start of every run and whenever
@@ -347,7 +394,7 @@ trap '_cut_short TERM' TERM; trap '_cut_short HUP' HUP; trap '_cut_short INT' IN
 healthy(){ systemctl is-active --quiet "$SERVICE" || return 1
     [ -z "$HEALTH_URL" ] || curl -fsS --max-time 8 "$HEALTH_URL" >/dev/null 2>&1 || return 1; return 0; }
 finish_success(){   # $1 = package sha, $2 = the status detail. Ordered; every step can be repeated.
-    echo "$1" > "$SHA_STATE"; rm -f "$DEFER_FILE"
+    echo "$1" > "$SHA_STATE"; rm -f "$DEFER_FILE"; end_wait
     ping_update "$(short "$1")"
     prune_copies      # 6.16.58: the one retention rule (this run's snapshot and the previous install are the newest and stay)
     _write_status success "$2"
@@ -415,42 +462,190 @@ ping_update(){
     local o; for o in $SITE_ORIGINS; do curl -fsS --max-time 8 "$o/update/ping?v=${1:-applied}" >/dev/null 2>&1 && return 0; done; return 0
 }
 
-# L3/U1 + U4: defer (at most MAX_DEFERRALS windows in a row) if the LIVE bot holds open positions — counted directly from the
-# positions table (closed rows are deleted, so COUNT(*) = open). Fail-open if the
-# mode/db/sqlite can't be determined (never block updates on an unknown).
-positions_open(){
+# 8.0.17 (the owner's ruling, 26 Nov): an update waits only while something is AT RISK RIGHT NOW (a LIVE bot that is running), and installs as soon as that clears. Simply holding positions does not make it wait.
+#   Read here from the data file (live, also for a bot too old to publish a report):  an order being placed or cancelled (a PENDING/RESOLVING order record younger than 2 minutes), an account switch clearing orders;
+#     a grid lot whose sell Smart TP has taken off the exchange ("armed"). A restore that only WAITS for the owner's review is a person's decision, not a risk: it does not hold.
+#   Read from the bot's own report DATA_DIR/restart_safety.json (what needs a price: a stop, a DCA trailing stop, a grid that stops at the edge of its range, within 2%; a Funding Harvest hedge that needs attention).
+#     A report older than 2 minutes while the bot runs counts only the orders in flight; no report (an older bot) leaves what the data file shows.
+#   Anything that cannot be read never holds an update back (it is said in the log). VN_SKIP_ON_OPEN_POSITIONS=0 installs now.
+RISK_REASON=""; RISK_BYPASS=0; RISK_QUIET=0; FORCED_NOTE=""
+risk_now(){      # 0 = wait (RISK_REASON: one line), 1 = go
+    RISK_REASON=""
     [ "$SKIP_ON_OPEN" = 1 ] || return 1
-    command -v python3 >/dev/null 2>&1 || { log "python3 not available — cannot check open positions; proceeding"; return 1; }
+    [ "$RISK_BYPASS" = 1 ] && return 1
+    command -v python3 >/dev/null 2>&1 || { log "python3 not available — cannot check whether something is at risk; proceeding"; return 1; }
     [ -f "$DB_PATH" ] || return 1
-    # 7.3.36 (install F6): python3's own sqlite3 module (the sqlite3 command-line tool is not installed on a fresh server), and the mode is read the way the bot reads it: the saved settings first (the dashboard's
-    # "go LIVE" writes them there), then .env
-    local n; n="$(python3 - "$DB_PATH" "$INSTALL_DIR/.env" <<'PYPO' 2>/dev/null || echo ''
-import sqlite3, sys
-db, env = sys.argv[1], sys.argv[2]
-mode = ""
+    local up=1; systemctl is-active --quiet "$SERVICE" 2>/dev/null || up=0
+    local out; out="$(python3 - "$DB_PATH" "$INSTALL_DIR/.env" "$DATA_DIR" "$up" <<'PYRISK' 2>/dev/null || echo ''
+import json, os, sqlite3, sys, time
+from datetime import datetime, timezone
+db, env, data, up = sys.argv[1:5]
 c = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+def setting(key):
+    r = c.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    return str(r[0]) if r and r[0] else ""
+# the mode is read the way the bot reads it: the saved settings first (the dashboard's "go LIVE" writes them there), then .env
 try:
-    r = c.execute("SELECT value FROM app_settings WHERE key='TRADING_MODE'").fetchone()
-    mode = (r[0] if r and r[0] else "") or ""
+    mode = setting("TRADING_MODE")
 except Exception:
     mode = ""
-if not str(mode).strip():
+if not mode.strip():
     try:
         for ln in open(env, encoding="utf-8", errors="ignore"):
             if ln.startswith("TRADING_MODE="):
                 mode = ln.split("=", 1)[1].strip()
     except Exception:
         pass
-mode = str(mode).strip().strip('"').strip("'").upper()
-if mode != "LIVE":
-    print("NOTLIVE")
+if mode.strip().strip('"').strip("'").upper() != "LIVE":
+    print("NOTLIVE"); sys.exit(0)
+if up != "1":
+    print("DOWN"); sys.exit(0)
+now = time.time()
+orders, offbook, notes = [], [], []
+def young(ts):
+    try:
+        d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return now - d.timestamp() < 120.0
+    except Exception:
+        return False
+unread = 0
+for sql in ("SELECT symbol, created_at FROM order_intents WHERE status IN ('PENDING','RESOLVING') ORDER BY rowid DESC LIMIT 200",
+            "SELECT symbol, created_at FROM futures_order_intents WHERE status='PENDING' ORDER BY rowid DESC LIMIT 200"):
+    try:
+        for sym, ts in c.execute(sql).fetchall():
+            if young(ts):
+                orders.append("%s: an order is being placed or cancelled" % sym)
+    except Exception as e:
+        unread += 1; notes.append("the order records could not be read (%s)" % type(e).__name__)
+try:
+    if setting("switch_state").strip().lower() == "clearing":
+        orders.append("an account switch is clearing orders")
+except Exception as e:
+    unread += 1; notes.append("the account switch state could not be read (%s)" % type(e).__name__)
+try:
+    for sym, js in c.execute("SELECT symbol, state_json FROM grid_state").fetchall():
+        try:
+            if any(l.get("chase_state") == "armed" for l in (json.loads(js).get("grid_levels") or [])):
+                offbook.append("%s: Smart TP has taken a sell off the exchange while it follows the price" % sym)
+        except Exception:
+            notes.append("the saved grid of %s could not be read" % sym)
+except Exception as e:
+    unread += 1; notes.append("the saved grids could not be read (%s)" % type(e).__name__)
+reasons = orders + offbook
+path = os.path.join(data, "restart_safety.json")
+if not os.path.exists(path):
+    notes.append("this bot publishes no restart safety report (an older version): orders being placed and a Smart TP sell off the exchange are checked")
 else:
-    print(int(c.execute("SELECT COUNT(*) FROM positions").fetchone()[0]))
-PYPO
+    try:
+        rep = json.load(open(path, encoding="utf-8"))
+        age = now - float(rep["ts"])
+        if -60.0 <= age <= 120.0:
+            if not rep["safe"]:
+                reasons += [str(x["text"]) for x in rep["reasons"]]
+            if rep.get("errors"):
+                notes.append("the bot could not check: %s" % ", ".join(str(x) for x in rep["errors"]))
+        else:
+            reasons = orders
+            notes.append("the bot's restart safety report is %d seconds old while the bot is running: only orders being placed are checked" % int(age))
+    except Exception as e:
+        notes.append("the bot's restart safety report could not be read (%s): the data file is checked" % type(e).__name__)
+for n in notes:
+    print("NOTE " + " ".join(n.split()))
+for r in reasons:
+    print("R " + " ".join(r.split())[:200])
+print("HOLD" if reasons else ("UNREAD" if unread else "GO"))
+PYRISK
 )"
-    [ "$n" = "NOTLIVE" ] && return 1
-    [[ "$n" =~ ^[0-9]+$ ]] || { log "could not read positions table — proceeding"; return 1; }
-    [ "$n" -gt 0 ]
+    local verdict; verdict="$(printf '%s\n' "$out" | tail -n 1)"
+    if [ "$RISK_QUIET" != 1 ]; then printf '%s\n' "$out" | sed -n 's/^NOTE //p' | while IFS= read -r _n; do log "update check: $_n"; done; fi
+    case "$verdict" in
+        NOTLIVE|GO) return 1 ;;
+        DOWN) [ "$RISK_QUIET" = 1 ] || log "the bot is not running: nothing is at risk from a restart"; return 1 ;;
+        UNREAD) log "update check: part of the data file could not be read — proceeding"; return 1 ;;
+        HOLD) local n; n="$(printf '%s\n' "$out" | grep -c '^R ')"
+            RISK_REASON="$(printf '%s\n' "$out" | sed -n 's/^R //p' | head -n 1)"
+            [ "$n" -gt 1 ] && RISK_REASON="$RISK_REASON (and $((n - 1)) more)"
+            return 0 ;;
+        *) log "could not read the data file to check for risk — proceeding"; return 1 ;;
+    esac
+}
+_pend_get(){ sed -n "s/^$1=//p" "$PENDING_FILE" 2>/dev/null | head -n 1; }
+_pend_put(){      # first ticks said reason [tried: when a downloaded package was last put down again because of a risk]
+    local t="${5:-$(_pend_get tried)}"
+    mkdir -p "$PREF_DIR" 2>/dev/null; printf 'first=%s\nticks=%s\nsaid=%s\nreason=%s\ntried=%s\n' "$1" "$2" "$3" "$4" "$t" > "$PENDING_FILE.tmp" 2>/dev/null && mv -f "$PENDING_FILE.tmp" "$PENDING_FILE" 2>/dev/null || warn "the waiting state could not be written"
+}
+_when(){ date -u -d "@$1" '+%d %b %H:%M UTC' 2>/dev/null || printf '%s' "$1"; }
+_wait_row(){      # first reason: the status row of a wait (the Support tab shows it)
+    _write_status skipped "Waiting since $(_when "$1") - $2. ${WAIT_WHAT:-It installs} as soon as this clears; after about 24 hours of waiting it goes ahead anyway."
+}
+_same_reason(){      # two reasons are the same when only a percentage differs ("1.3% from its stop" and "1.1% from its stop")
+    [ "$(printf '%s' "$1" | sed 's/[0-9][0-9.]*%/%/g')" = "$(printf '%s' "$2" | sed 's/[0-9][0-9.]*%/%/g')" ]
+}
+_ceiling_hit(){      # first ticks: 0 when the longest wait is over (that many re-checks saw a risk, or 48 hours by the clock)
+    local now; now="$(date +%s)"
+    [ "$2" -ge "$WAIT_MAX_TICKS" ] || [ $((now - $1)) -ge "$WAIT_BACKSTOP_SEC" ]
+}
+_force(){      # first ticks: the longest wait is over: go ahead, and say why
+    local now waited hours; now="$(date +%s)"; waited=$((now - $1)); [ "$waited" -ge 0 ] || waited=0
+    hours=$(( ($2 * 120 > waited ? $2 * 120 : waited) / 3600 ))
+    RISK_BYPASS=1; FORCED_NOTE="after waiting $hours hours ($RISK_REASON at the time)"
+    log "waited $hours hours — installing now although: $RISK_REASON"
+}
+must_wait(){      # THE one question of every place that is about to touch the bot: 0 = wait (said and remembered), 1 = go (nothing at risk, or the longest wait is over)
+    risk_now || return 1
+    if [ "$(load_pref)" != off ]; then
+        local first ticks
+        # a wait that a failed run parked is taken up again (not one older than 4 days: that was another matter)
+        if [ ! -f "$PENDING_FILE" ] && [ -f "$PENDING_FILE.kept" ]; then
+            first="$(sed -n 's/^first=//p' "$PENDING_FILE.kept" | head -n 1)"
+            if [[ "$first" =~ ^[0-9]+$ ]] && [ $(($(date +%s) - first)) -lt 345600 ]; then mv -f "$PENDING_FILE.kept" "$PENDING_FILE"; else rm -f "$PENDING_FILE.kept"; fi
+        fi
+        first="$(_pend_get first)"; ticks="$(_pend_get ticks)"
+        [[ "$ticks" =~ ^[0-9]+$ ]] || ticks=0
+        if [[ "$first" =~ ^[0-9]+$ ]] && _ceiling_hit "$first" "$ticks"; then _force "$first" "$ticks"; return 1; fi
+    fi
+    hold_update; return 0
+}
+_now_command(){ printf 'curl -fsSL %s | sudo VN_SKIP_ON_OPEN_POSITIONS=0 bash' "$(updater_urls | head -n 1)"; }
+hold_update(){      # this run found something at risk: remember it, say it, make sure it is looked at again
+    if [ "$(load_pref)" = off ]; then
+        end_wait
+        log "update waiting: $RISK_REASON. Automatic updates are off, so run the update again later, or install it now with:  $(_now_command)"
+        _write_status skipped "Not installed yet - $RISK_REASON. Automatic updates are off: run the update again later."; return 0
+    fi
+    local now first ticks; now="$(date +%s)"; first="$(_pend_get first)"; ticks="$(_pend_get ticks)"
+    [[ "$first" =~ ^[0-9]+$ ]] || first="$now"; [[ "$ticks" =~ ^[0-9]+$ ]] || ticks=0
+    _pend_put "$first" "$ticks" "$now" "$RISK_REASON"
+    ensure_wait_timer
+    log "update waiting: $RISK_REASON. It is checked again every 2 minutes and installs as soon as this clears (at the latest after 24 hours). To install it now:  $(_now_command)"
+    _wait_row "$first" "$RISK_REASON"
+}
+recheck_decide(){      # a re-check run (--recheck): ends here unless the waiting update is to be installed now
+    [ -f "$PENDING_FILE" ] || { end_wait park; exit 0; }
+    if [ "$(load_pref)" = off ]; then drop_wait; exit 0; fi
+    local now first ticks said was waited; now="$(date +%s)"; first="$(_pend_get first)"; ticks="$(_pend_get ticks)"; said="$(_pend_get said)"; was="$(_pend_get reason)"
+    [[ "$first" =~ ^[0-9]+$ ]] || first="$now"; [[ "$ticks" =~ ^[0-9]+$ ]] || ticks=0; [[ "$said" =~ ^[0-9]+$ ]] || said=0
+    waited=$((now - first)); [ "$waited" -ge 0 ] || waited=0
+    RISK_QUIET=1
+    if risk_now; then
+        ticks=$((ticks + 1))
+        if _ceiling_hit "$first" "$ticks"; then
+            _pend_put "$first" "$ticks" "$now" "$RISK_REASON"
+            _force "$first" "$ticks"
+        else
+            if ! _same_reason "$RISK_REASON" "$was" || [ $((now - said)) -ge 3600 ] || [ $((now - said)) -lt 0 ]; then
+                log "update waiting: $RISK_REASON (for $((waited / 60)) minutes)"; said="$now"; was="$RISK_REASON"; _wait_row "$first" "$RISK_REASON"
+            fi
+            _pend_put "$first" "$ticks" "$said" "$was"; exit 0
+        fi
+    else
+        local tried; tried="$(_pend_get tried)"
+        if [[ "$tried" =~ ^[0-9]+$ ]] && [ $((now - tried)) -ge 0 ] && [ $((now - tried)) -lt "$RETRY_AFTER_SEC" ]; then exit 0; fi
+        log "the risk has cleared after $((waited / 60)) minutes — installing now"
+    fi
+    RISK_QUIET=0
 }
 
 # M2 + U3: snapshot config AND the real DB (DATA_DIR); returns the snapshot dir via stdout. Called AFTER the service is stopped. The data files are
@@ -621,7 +816,7 @@ move_names_installed(){   # from a copy of the installed deploy folder
 }
 
 # ── args ─────────────────────────────────────────────────────────────────────
-MIGRATE_NOW=0
+MIGRATE_NOW=0; RECHECK=0
 case "${1:-}" in
     --enable)  enable_auto; exit 0 ;;
     --disable) disable_auto; exit 0 ;;
@@ -629,7 +824,8 @@ case "${1:-}" in
     --no-migrate-layout) mkdir -p "$PREF_DIR"; : > "$MIGRATE_OPTOUT"; echo "This box stays on the old folder names (a package update does not move them)."; exit 0 ;;
     --move-names) MIGRATE_NOW=3 ;;      # 7.3.38, on request: moves the state folder, backup folder, certificate folder and web-server site to the new names now (also after a failed move)
     --migrate-layout) MIGRATE_NOW=1; rm -f "$MIGRATE_OPTOUT" ;;      # on request: moves the box to the new names now (also one that was held back or whose earlier move failed)
-    --help|-h) echo "usage: vn-update.sh [--setup|--enable|--disable|--migrate-layout|--move-names|--no-migrate-layout]  (no arg = update now + offer auto-update)"; exit 0 ;;
+    --help|-h) echo "usage: vn-update.sh [--setup|--enable|--disable|--recheck|--migrate-layout|--move-names|--no-migrate-layout]  (no arg = update now + offer auto-update)"; exit 0 ;;
+    --recheck) RECHECK=1 ;;      # 8.0.17: the 2-minute re-check of a waiting update (silent when nothing waits)
     "" )       : ;;
     * )        die "unknown option: $1" ;;
 esac
@@ -639,13 +835,19 @@ esac
 # it does NOT download code. So we must download + verify + extract the new dist OURSELVES,
 # rename the current install to OLD (install.sh recovers the live license/pubkey from it),
 # then finalize — mirroring the manual scp+extract+install flow.
-self_refresh "$@"
-install_self
-exec 9>"$LOCK"; flock -n 9 || { log "another run in progress — skip"; exit 0; }
+if [ "$RECHECK" = 1 ]; then
+    [ -f "$PENDING_FILE" ] || { end_wait park; exit 0; }      # nothing waits: no network, no line in the log
+else
+    self_refresh "$@"
+    install_self
+fi
+exec 9>"$LOCK"; flock -n 9 || { [ "$RECHECK" = 1 ] || log "another run in progress — skip"; exit 0; }
 # 7.3.38: an updater of an EARLIER version (aq-update.sh, which takes aq-update.lock) that is still running counts too: two updaters never work on the folders at the same time
 _earlier_lock="$(dirname "$LOCK")/aq-update.lock"
 if [ -e "$_earlier_lock" ] && ! ( flock -n 8 ) 8<"$_earlier_lock"; then log "another run in progress (an updater of an earlier version) — skip"; exit 0; fi
 [ -d "$INSTALL_DIR" ] || die "install dir $INSTALL_DIR not found — is the bot installed?"
+rm -f "$DEFER_FILE" "$PREF_DIR/migrate-deferrals" 2>/dev/null || true      # 8.0.17: the earlier 3-window counters are retired
+[ "$RECHECK" = 1 ] && recheck_decide
 move_update_units      # 7.3.38: a box that still has the update timer under its earlier name is moved to the new one (before anything else; a failure puts the earlier timer back)
 if [ "$MIGRATE_NOW" = 1 ]; then
     if ! on_old_names; then
@@ -668,7 +870,7 @@ if [ "$MIGRATE_NOW" = 3 ]; then
     names_pending || { log "system names: this box is already on the new names (or has its own layout, or the folder names are not moved yet) - nothing to move"; exit 0; }
     move_names_installed; exit $?
 fi
-command -v "$REQUIRED_PYTHON" >/dev/null 2>&1 || { log "SKIP: $REQUIRED_PYTHON not found — not a supported update target."; _write_status skipped "Unsupported OS (needs $REQUIRED_PYTHON)"; exit 0; }
+command -v "$REQUIRED_PYTHON" >/dev/null 2>&1 || { log "SKIP: $REQUIRED_PYTHON not found — not a supported update target."; _write_status skipped "Unsupported OS (needs $REQUIRED_PYTHON)"; end_wait; exit 0; }
 command -v unzip >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip >/dev/null 2>&1 || true
 command -v unzip >/dev/null 2>&1 || die "unzip not available (apt-get install unzip)"
 
@@ -677,30 +879,20 @@ select_unit || true; resume_interrupted; LOCAL_SHA="$(cat "$SHA_STATE" 2>/dev/nu
 if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$LOCAL_SHA" ]; then
     log "already current (pkg $(short "$REMOTE_SHA")) — no update, not counted"
     _write_status checked_no_update "Already up to date"
-    # 7.2.0: a box still on the old names (the move was not quiet enough, or its opt-out was lifted since) is moved now; the same quiet rule as an update (open positions defer it, at most MAX_DEFERRALS windows)
+    # 7.2.0: a box still on the old names (the move was not quiet enough, or its opt-out was lifted since) is moved now; the same rule as an update (something at risk right now makes it wait, 8.0.17)
     if { on_old_names || db_rename_pending || names_pending; } && [ ! -e "$MIGRATE_OPTOUT" ] && [ -f "$INSTALL_DIR/deploy/migrate-layout.sh" ]; then
-        _mdef="$(cat "$PREF_DIR/migrate-deferrals" 2>/dev/null || echo 0)"; [[ "$_mdef" =~ ^[0-9]+$ ]] || _mdef=0
-        if positions_open && [ "$_mdef" -lt "$MAX_DEFERRALS" ]; then
-            echo $((_mdef + 1)) > "$PREF_DIR/migrate-deferrals"; log "folder names: open positions present (LIVE) - the move waits for the next window ($((_mdef + 1)) of $MAX_DEFERRALS)"
-        else
-            rm -f "$PREF_DIR/migrate-deferrals"; migrate_installed || exit 1; rename_db_installed || exit 1; move_names_installed || exit 1
+        WAIT_WHAT="The folder names move"
+        if ! must_wait; then
+            end_wait; migrate_installed || exit 1; rename_db_installed || exit 1; move_names_installed || exit 1
         fi
+    else
+        end_wait
     fi
     [ -z "$(load_pref)" ] && prompt_pref || true; exit 0
 fi
 [ -n "$REMOTE_SHA" ] || die "cannot read the package checksum from any origin ($SITE_ORIGINS) — nothing was installed"
 log "new package: $(short "$REMOTE_SHA") (was $(short "$LOCAL_SHA"))"
-if positions_open; then
-    _def="$(cat "$DEFER_FILE" 2>/dev/null || echo 0)"; [[ "$_def" =~ ^[0-9]+$ ]] || _def=0
-    if [ "$_def" -lt "$MAX_DEFERRALS" ]; then
-        _def=$((_def + 1)); echo "$_def" > "$DEFER_FILE"
-        log "open positions present (LIVE) — deferring update to next window ($_def of $MAX_DEFERRALS)"
-        _write_status skipped "Deferred — open positions (window $_def of $MAX_DEFERRALS)"; exit 0
-    fi
-    log "open positions still present after $MAX_DEFERRALS deferred windows — updating anyway (positions are saved and checked again when the bot restarts)"
-else
-    rm -f "$DEFER_FILE"
-fi
+if must_wait; then exit 0; fi      # asked here (nothing is downloaded while something is at risk) and again just before the bot is stopped
 TS="$(date +%Y%m%d-%H%M%S)"; _target_ver=""
 
 # 1) the code package (downloaded and verified in step 2)
@@ -754,24 +946,30 @@ rm -f "$TMP_ZIP"
 STAGE_TOP=""; for _d in "$STAGE"/*/; do [ -d "$_d" ] && STAGE_TOP="${_d%/}"; done
 [ -n "$STAGE_TOP" ] && [ -f "$STAGE_TOP/install.sh" ] || { rm -rf "$STAGE"; die "bad dist (no install.sh) — nothing was changed"; }
 
+# 2b-1b) 8.0.17: asked AGAIN, now that the package is downloaded and checked and before anything below touches or stops the bot: something may have come at risk in between
+if must_wait; then rm -rf "$STAGE"; [ ! -f "$PENDING_FILE" ] || _pend_put "$(_pend_get first)" "$(_pend_get ticks)" "$(_pend_get said)" "$(_pend_get reason)" "$(date +%s)"; exit 0; fi
+
 # 2b-2) 7.3.36 (install F7): what the installer needs is checked BEFORE the bot is stopped and the folders are swapped (it was checked only inside the installer, after the stop: a box that failed these was stopped,
 #       rolled back and restarted every night). Python 3.12 must be able to make an environment, and there must be room for the new one beside the old one (the size of the old one plus 300 MB; 1.5 GB when it has none).
 if ! "$REQUIRED_PYTHON" -c 'import venv, ensurepip' >/dev/null 2>&1; then
     rm -rf "$STAGE"; log "SKIP: $REQUIRED_PYTHON cannot make a Python environment (its venv package is missing). Nothing was changed."
-    _write_status skipped "Python 3.12 cannot make a Python environment (its venv package is missing)"; exit 0
+    _write_status skipped "Python 3.12 cannot make a Python environment (its venv package is missing)"; end_wait; exit 0
 fi
 _need_kb=1572864; [ -d "$INSTALL_DIR/venv" ] && _need_kb=$(( $(du -sk "$INSTALL_DIR/venv" 2>/dev/null | cut -f1) + 307200 ))
 _free_kb="${VN_DISK_FREE_KB:-$(df -Pk "$_parent" 2>/dev/null | awk 'NR==2 {print $4}')}"
 if [[ "$_need_kb" =~ ^[0-9]+$ && "$_free_kb" =~ ^[0-9]+$ ]] && [ "$_free_kb" -lt "$_need_kb" ]; then
     _nx="$(awk -v k="$_need_kb" 'BEGIN { printf "%.1f", k / 1048576 }')"; _fy="$(awk -v k="$_free_kb" 'BEGIN { printf "%.1f", k / 1048576 }')"
     rm -rf "$STAGE"; log "SKIP: There is not enough free disk space to refresh the bot's Python environment: about $_nx GB is needed and $_fy GB is free. Free some space and run the update again. Nothing was changed."
-    _write_status skipped "Not enough free disk space for the update (about $_nx GB needed, $_fy GB free)"; exit 0
+    _write_status skipped "Not enough free disk space for the update (about $_nx GB needed, $_fy GB free)"; end_wait; exit 0
 fi
 
 # 2c) FOLDER NAMES (7.2.0): a box still on the old names moves to the new ones now, from the new package's own script, at this quiet moment (the gate above) and before the install step. It is on by default;
 #     a failed move is put back by itself and not tried again; "vardynnode --no-migrate-layout" holds a box back.
-maybe_migrate "$STAGE_TOP/deploy" || { rm -rf "$STAGE"; exit 1; }
-maybe_move_names "$STAGE_TOP/deploy" || { rm -rf "$STAGE"; exit 1; }      # 7.3.38: the state folder, backup folder, certificate folder and web-server site
+maybe_migrate "$STAGE_TOP/deploy" || { end_wait park; rm -rf "$STAGE"; exit 1; }
+maybe_move_names "$STAGE_TOP/deploy" || { end_wait park; rm -rf "$STAGE"; exit 1; }      # 7.3.38: the state folder, backup folder, certificate folder and web-server site
+
+if must_wait; then rm -rf "$STAGE"; [ ! -f "$PENDING_FILE" ] || _pend_put "$(_pend_get first)" "$(_pend_get ticks)" "$(_pend_get said)" "$(_pend_get reason)" "$(date +%s)"; exit 0; fi      # immediately before the stop (the folder moves above restart the bot)
+end_wait park      # 8.0.17: the install goes ahead: nothing is looked at every 2 minutes any more; success removes the parked state
 
 # 3) STAGE — config/db snapshot, then rename current install aside as OLD (secret source + rollback)
 OLD_DIR="${INSTALL_DIR}.OLD-$TS"
@@ -780,6 +978,7 @@ _STATUS_WRITTEN=0; _RUN_ACTIVE=1      # 7.3.40: from here a cut-short run says s
 mark_updating
 systemctl stop "$SERVICE" 2>/dev/null || true
 rm -f "$UNIT_DIR/$SERVICE.service.prev"      # 6.16.56: only a unit saved by THIS run's installer may be put back on a rollback
+rm -f "$DATA_DIR/restart_safety.json" 2>/dev/null || true      # 8.0.17: the report of the stopped bot: the next one writes its own
 STOP_EPOCH="$(date +%s)"
 prune_copies      # first, so the new snapshot has room (the copies of earlier updates were never removed)
 SNAP="$(make_snapshot "$TS")"
@@ -802,6 +1001,7 @@ log "finalizing via install.sh --update $OLD_DIR"
 VN_OLD_VENV_DIR="$OLD_DIR/venv" VN_NONINTERACTIVE=1 VN_FORCE=1 VN_FROM_UPDATER=1 bash "$INSTALL_DIR/install.sh" --update "$OLD_DIR" >"$INST_LOG" 2>&1 || INSTALLER_FAILED=1      # 7.3.36 (F12): the old environment is parked here: the installer measures it
 [ "$INSTALLER_FAILED" = 1 ] && { log "installer exited non-zero — last lines:"; tail -n 20 "$INST_LOG" | while IFS= read -r _l; do log "  | $_l"; done; }
 cat "$INST_LOG" >> "$LOG" 2>/dev/null || true; rm -f "$INST_LOG"
+log "the bot was stopped for about $(( $(date +%s) - STOP_EPOCH )) seconds (from the stop to the end of the installer)"
 restore_config "$SNAP"
 # 7.3.25: the version being installed is read AGAIN now that the installer has built the venv (the read above ran before it existed on a real box, so the status recorded an empty target)
 [ -n "$_target_ver" ] || _target_ver="$( (cd "$INSTALL_DIR" && ./venv/bin/python -c 'import core.version as v; print(v.BUILD_PHASE)') 2>/dev/null | tail -1 )"
@@ -817,7 +1017,7 @@ if [ "$INSTALLER_FAILED" = 0 ] && [ "$_stayed_up" = 1 ]; then
     # version is baked into the compiled core/version.so — read it via the bot's venv
     _ver="$( (cd "$INSTALL_DIR" && ./venv/bin/python -c 'import core.version as v; print(v.BUILD_PHASE)') 2>/dev/null | tail -1 )"
     [ -z "$_ver" ] && _ver="$(short "$REMOTE_SHA")"
-    finish_success "$REMOTE_SHA" "Updated and healthy" || exit 1      # 7.3.40: the ordered tail (package marker, count, clean-up, status row, data-file rename, run state)
+    finish_success "$REMOTE_SHA" "Updated and healthy${FORCED_NOTE:+ $FORCED_NOTE}" || exit 1      # 7.3.40: the ordered tail (package marker, count, clean-up, status row, data-file rename, run state)
     printf "\n\033[32m===================================================\n"
     printf "  \342\234\224 UPDATE SUCCESSFUL\n"
     printf "  You are running VardynNode %s now.\n" "$_ver"
@@ -842,6 +1042,7 @@ if [ -d "$OLD_DIR" ]; then
     if [ -f "$UNIT_DIR/$SERVICE.service.prev" ]; then
         cp -a "$UNIT_DIR/$SERVICE.service.prev" "$UNIT_DIR/$SERVICE.service" && systemctl daemon-reload && log "service unit restored to the previous one"
     fi
+    systemctl stop "$SERVICE" 2>/dev/null || true; rm -f "$DATA_DIR/restart_safety.json" 2>/dev/null || true      # 8.0.17: a report written by the failed version must not speak for the one put back
     svc restart || true; sleep 5
     if healthy; then log "rollback SUCCESS — previous version restored"; _write_status rolled_back "Update failed; previous version restored and running"; _fail_banner restored; else log "rollback restored previous dir but health STILL failing — MANUAL ATTENTION (config $SNAP)"; _write_status failed "Update failed; bot not running — manual attention"; _fail_banner manual; fi
 else
